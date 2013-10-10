@@ -14,10 +14,26 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.camel.component.apns.model;
 
-public enum ConnectionStrategy {
+package org.apache.camel.component.hazelcast;
 
-    SIMPLE, QUEUE, POOL
+import org.apache.camel.Exchange;
+import org.apache.camel.impl.DefaultProducer;
 
+public abstract class HazelcastDefaultProducer extends DefaultProducer {
+
+    private final HazelcastComponentHelper helper = new HazelcastComponentHelper();
+
+    public HazelcastDefaultProducer(HazelcastDefaultEndpoint endpoint) {
+        super(endpoint);
+    }
+
+    @Override
+    public HazelcastDefaultEndpoint getEndpoint() {
+        return (HazelcastDefaultEndpoint)super.getEndpoint();
+    }
+
+    protected int lookupOperationNumber(Exchange exchange) {
+        return helper.lookupOperationNumber(exchange, getEndpoint().getDefaultOperation());
+    }
 }
