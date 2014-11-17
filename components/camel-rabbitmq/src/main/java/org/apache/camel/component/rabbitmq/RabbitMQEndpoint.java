@@ -47,7 +47,10 @@ public class RabbitMQEndpoint extends DefaultEndpoint {
     private boolean durable = true;
     private String queue = String.valueOf(UUID.randomUUID().toString().hashCode());
     private String exchangeName;
+    private String exchangeType = "direct";
     private String routingKey;
+    private int concurrentConsumers = 1;
+    private int prefetchCount = 100;
     
     public RabbitMQEndpoint() {
     }
@@ -195,6 +198,30 @@ public class RabbitMQEndpoint extends DefaultEndpoint {
 
     public void setExchangeName(String exchangeName) {
         this.exchangeName = exchangeName;
+    }
+
+    public String getExchangeType() {
+        return exchangeType;
+    }
+
+    public void setExchangeType(String exchangeType) {
+        this.exchangeType = exchangeType;
+    }
+
+    public int getConcurrentConsumers() {
+        return concurrentConsumers;
+    }
+
+    public void setConcurrentConsumers(int concurrentConsumers) {
+        this.concurrentConsumers = concurrentConsumers;
+    }
+
+    public int getPrefetchCount() {
+        return prefetchCount;
+    }
+
+    public void setPrefetchCount(int prefetchCount) {
+        this.prefetchCount = prefetchCount;
     }
 
     public String getRoutingKey() {

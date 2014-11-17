@@ -17,26 +17,31 @@
 package org.apache.camel.component.rabbitmq;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import org.apache.camel.ServiceStatus;
+import org.apache.camel.impl.DefaultConsumer;
+import org.apache.camel.spi.Synchronization;
 
 import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.Envelope;
-import org.apache.camel.Exchange;
-import org.apache.camel.Processor;
-import org.apache.camel.impl.DefaultConsumer;
 
 public class RabbitMQConsumer extends DefaultConsumer {
     
     ExecutorService executor;
     Connection conn;
-    Channel channel;
+    List<Channel> channels = new ArrayList<Channel>();
 
     private final RabbitMQEndpoint endpoint;
 
-    public RabbitMQConsumer(RabbitMQEndpoint endpoint, Processor processor) {
+    public RabbitMQConsumer(final RabbitMQEndpoint endpoint, final Processor processor) {
         super(endpoint, processor);
         this.endpoint = endpoint;
     }
@@ -51,27 +56,35 @@ public class RabbitMQConsumer extends DefaultConsumer {
 
         conn = endpoint.connect(executor);
         log.debug("Using conn {}", conn);
-
-        channel = conn.createChannel();
-        log.debug("Using channel {}", channel);
-
-        channel.exchangeDeclare(endpoint.getExchangeName(),
-                "direct",
-                endpoint.isDurable(),
-                endpoint.isAutoDelete(),
-                new HashMap<String, Object>());
         
-        // need to make sure the queueDeclare is same with the exchange declare
-        channel.queueDeclare(endpoint.getQueue(), endpoint.isDurable(), false, endpoint.isAutoDelete(), null);
-        channel.queueBind(endpoint.getQueue(), endpoint.getExchangeName(),
-                endpoint.getRoutingKey() == null ? "" : endpoint.getRoutingKey());
-
-        channel.basicConsume(endpoint.getQueue(), endpoint.isAutoAck(), new RabbitConsumer(this, channel));
+        for (int i = 0; i < this.endpoint.getConcurrentConsumers(); i++) {
+            Channel channel = conn.createChannel();
+            log.debug("Using channel {}", channel);
+    
+            channel.exchangeDeclare(endpoint.getExchangeName(),
+                    "direct",
+                    endpoint.isDurable(),
+                    endpoint.isAutoDelete(),
+                    new HashMap<String, Object>());
+            
+            // need to make sure the queueDeclare is same with the exchange declare
+            channel.queueDeclare(endpoint.getQueue(), endpoint.isDurable(), false, endpoint.isAutoDelete(), null);
+            channel.queueBind(endpoint.getQueue(), endpoint.getExchangeName(),
+                    endpoint.getRoutingKey() == null ? "" : endpoint.getRoutingKey());
+            channel.basicQos(this.endpoint.getPrefetchCount());
+            channel.basicConsume(endpoint.getQueue(), endpoint.isAutoAck(), new RabbitConsumer(this, channel));
+            this.channels.add(channel);
+        }
     }
 
     @Override
     protected void doStop() throws Exception {
         super.doStop();
+        for (Channel channel : this.channels) {
+          if (channel.isOpen()) {
+            channel.close();
+          }
+        }
         log.info("Stopping RabbitMQ consumer");
         if (conn != null) {
             try {
@@ -81,8 +94,8 @@ public class RabbitMQConsumer extends DefaultConsumer {
             }
         }
 
-        channel = null;
-        conn = null;
+        this.channels = null;
+        this.conn = null;
         if (executor != null) {
             if (getEndpoint() != null && getEndpoint().getCamelContext() != null) {
                 getEndpoint().getCamelContext().getExecutorServiceManager().shutdownNow(executor);
@@ -103,33 +116,89 @@ public class RabbitMQConsumer extends DefaultConsumer {
          *
          * @param channel the channel to which this consumer is attached
          */
-        public RabbitConsumer(RabbitMQConsumer consumer, Channel channel) {
+        public RabbitConsumer(final RabbitMQConsumer consumer, final Channel channel) {
             super(channel);
             this.consumer = consumer;
             this.channel = channel;
         }
 
         @Override
-        public void handleDelivery(String consumerTag,
-                                   Envelope envelope,
-                                   AMQP.BasicProperties properties,
-                                   byte[] body) throws IOException {
+        public void handleDelivery(final String consumerTag,
+                                   final Envelope envelope,
+                                   final AMQP.BasicProperties properties,
+                                   final byte[] body) throws IOException {
 
             Exchange exchange = consumer.endpoint.createRabbitExchange(envelope, body);
+            mergeAmqpProperties(exchange, properties);
             log.trace("Created exchange [exchange={}]", new Object[]{exchange});
 
             try {
-                consumer.getProcessor().process(exchange);
-
-                long deliveryTag = envelope.getDeliveryTag();
-                if (!consumer.endpoint.isAutoAck()) {
-                    log.trace("Acknowledging receipt [delivery_tag={}]", deliveryTag);
-                    channel.basicAck(deliveryTag, false);
+                if ((!ServiceStatus.Stopped.equals(exchange.getContext().getStatus())) && (!ServiceStatus.Stopping.equals(exchange.getContext().getStatus()))) {
+                    if (!this.consumer.endpoint.isAutoAck()) {
+                        final long deliveryTag = envelope.getDeliveryTag();
+                        exchange.addOnCompletion(new Synchronization() {
+                            @Override
+                            public void onFailure(final Exchange arg0) {
+                                RabbitMQConsumer.this.log.trace("Not acknowledging receipt. Exchange failed [delivery_tag={}]", Long.valueOf(deliveryTag));
+                            }
+                        
+                            @Override
+                            public void onComplete(final Exchange arg0) {
+                                try {
+                                    log.trace("Acknowledging receipt [delivery_tag={}]", Long.valueOf(deliveryTag));
+                                    channel.basicAck(deliveryTag, false);
+                                } catch (IOException e) {
+                                    RabbitMQConsumer.this.log.error("Exception occurred when Acknowledging [delivery_tag={}", Long.valueOf(deliveryTag), e);
+                                }
+                            }
+                        });
+                    }
+                    this.consumer.getProcessor().process(exchange);
                 }
-
-            } catch (Exception e) {
-                getExceptionHandler().handleException("Error processing exchange", exchange, e);
             }
+            catch (Exception e) {
+                RabbitMQConsumer.this.getExceptionHandler().handleException("Error processing exchange", exchange, e);
+            }
+        }
+        
+        private void mergeAmqpProperties(final Exchange exchange, final AMQP.BasicProperties properties)
+        {
+          if (properties.getType() != null) {
+            exchange.getIn().setHeader("rabbitmq.TYPE", properties.getType());
+          }
+          if (properties.getAppId() != null) {
+            exchange.getIn().setHeader("rabbitmq.APP_ID", properties.getAppId());
+          }
+          if (properties.getClusterId() != null) {
+            exchange.getIn().setHeader("rabbitmq.CLUSTERID", properties.getClusterId());
+          }
+          if (properties.getContentEncoding() != null) {
+            exchange.getIn().setHeader("rabbitmq.CONTENT_ENCODING", properties.getContentEncoding());
+          }
+          if (properties.getContentType() != null) {
+            exchange.getIn().setHeader("rabbitmq.CONTENT_TYPE", properties.getContentType());
+          }
+          if (properties.getCorrelationId() != null) {
+            exchange.getIn().setHeader("rabbitmq.CORRELATIONID", properties.getCorrelationId());
+          }
+          if (properties.getExpiration() != null) {
+            exchange.getIn().setHeader("rabbitmq.EXPIRATION", properties.getExpiration());
+          }
+          if (properties.getMessageId() != null) {
+            exchange.getIn().setHeader("rabbitmq.MESSAGE_ID", properties.getMessageId());
+          }
+          if (properties.getPriority() != null) {
+            exchange.getIn().setHeader("rabbitmq.PRIORITY", properties.getPriority());
+          }
+          if (properties.getReplyTo() != null) {
+            exchange.getIn().setHeader("rabbitmq.REPLY_TO", properties.getReplyTo());
+          }
+          if (properties.getTimestamp() != null) {
+            exchange.getIn().setHeader("rabbitmq.TIMESTAMP", properties.getTimestamp());
+          }
+          if (properties.getUserId() != null) {
+            exchange.getIn().setHeader("rabbitmq.USERID", properties.getUserId());
+          }
         }
     }
 }
